@@ -1,0 +1,396 @@
+---
+title: "Report Project II"
+output: pdf_document
+date: "November 2022"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Importing Libraries
+library(rio)
+library(ggplot2)
+library(broom)
+library(car)
+library(dplyr)
+library(nnet)
+library(tree)
+library(randomForest)
+library(e1071)
+library(tidyr)
+
+### Importing & Mutating Datasets
+  
+  ## Importing Datasets
+health = import('../Datasets/amsterdam_health.csv', stringsAsFactors = TRUE)
+income = import('../Datasets/amsterdam_income.csv', stringsAsFactors = TRUE)
+population = import('../Datasets/amsterdam_population.csv', stringsAsFactors = TRUE)
+public_space = import('../Datasets/amsterdam_publicspace.csv', stringsAsFactors = TRUE)
+social = import('../Datasets/amsterdam_social.csv', stringsAsFactors = TRUE)
+housing = import('../Datasets/amsterdam_housing.csv', stringsAsFactors = TRUE)
+
+  ## Joining Datasets
+all_data = inner_join(health, income)
+all_data = inner_join(all_data, population)
+all_data = inner_join(all_data, public_space)
+all_data = inner_join(all_data, social)
+all_data = inner_join(all_data, housing)
+
+  ## Mutating Datasets
+all_data = all_data %>%
+  mutate(avg_greenery = pub_area_green / (pub_area_land + pub_area_water))
+all_data = all_data %>%
+  mutate(tot_facilities = soc_fac_cultural + soc_fac_sports)
+all_data = all_data %>%
+  mutate(pop_elder = (pop_60_69 + pop_70_79 + pop_80_89 + pop_90) / pop_total)
+
+all_data$district = factor(all_data$district)
+
+### Functions for Classifier Evaluation
+  
+  # Accuracy
+accuracy <- function(y, yhat) {
+  sum(yhat == y) / length(y)
+}
+
+  # Precision
+precision <- function(y, yhat, class = NULL) {
+  if(missing(class))
+    p <- sapply(levels(y), precision, y = y, yhat = yhat)
+  else
+    p <- sum(yhat == class & yhat == y) / sum(yhat == class)
+  
+  ifelse(is.finite(p), p, 0)
+}
+
+  # Recall
+recall <- function(y, yhat, class = NULL) {
+  if(missing(class))
+    r <- sapply(levels(y), recall, y = y, yhat = yhat)
+  else
+    r <- sum(yhat == class & yhat == y) / sum(y == class)
+  
+  ifelse(is.finite(r), r, 0)
+}
+  
+  # F
+f <- function(y, yhat, class = NULL) {
+  if(missing(class))
+    ff <- sapply(levels(y), f, y = y, yhat = yhat)
+  else {
+    p <- precision(y, yhat, class)
+    r <- recall(y, yhat, class)
+    ff <- 2*p*r/(p+r)
+  }
+  
+  ifelse(is.finite(ff), ff, 0)
+}
+
+  # Confusion Matrix
+confusion_matrix <- function(y, yhat) {
+  table(truth = y, predicted = yhat) %>%
+    as.data.frame() %>%
+    ggplot(aes(predicted, truth)) +
+    geom_tile(aes(fill = Freq)) +
+    geom_text(aes(label = Freq)) +
+    scale_fill_gradient(low = "white", high = "lightblue")
+}
+
+### Functions for Cross Validation
+kfold_cv <- function(data, response, k, H, FUN, ...) {
+  
+  # randomly assign instances to folds in a column called .fold, stratified by class
+  data <- data %>%
+    group_by({{response}}) %>%
+    mutate(.fold = sample(rep(1:k, length.out = n()))) %>%
+    ungroup()
+  
+  # for each value h in H to explore, do CV
+  all_folds <- lapply(H, function(h) {
+    # for each fold kk = 1...k
+    per_fold <- lapply(1:k, function(kk) {
+      # partition the data in training and validation
+      training <- data %>% filter(.fold != kk) # everything except fold kk
+      validation <- data %>% filter(.fold == kk) # only fold kk
+      # call the FUNction to train the model and compute performance
+      l <- FUN(training, validation, h, ...)
+      if(!is.list(l)) stop("The cross-validation function must return a list of metric scores")
+      
+      l %>%  
+        as.data.frame() %>% 
+        mutate(.h = h, .fold = kk, .before = 1)
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+  
+  all_folds
+}
+
+```
+
+Pelle Kuppens, Annika Waltmann, Marta Nosowicz, Sam Groen
+
+# Introduction
+This report is a follow-up to the Exloratory Data Analysis (2022) report. The previous report contained an analysis of available data about Amsterdam’s health and public space conditions. It aimed to inform the governing bodies of the city about the current situation regarding these topics and support policy development, innovation, and implementation.  
+
+The analysis was carried out by analyzing three main datasets and two secondary datasets obtained through the municipality of Amsterdam using the programme RStudio. The used datasets contained information about:  
+
+* self-perceived health conditions (including, overall health, psychological health, loneliness, and obesity), 
+* perceived quality of public spaces and the relative amount of available hectares of greenery,
+* the population’s amount, age, gender and employment status
+
+Additional datasets were analyzed to understand the discovered trends in relations between health and public spaces. Those datasets included information about: income, housing, social facilities. 
+
+Some results of the previous analysis of the data point to a relationship between the social status and health quality among inhabitants. In richer districts of Amsterdam people are more likely to perceive their health as good. Additionally, the data also showed that individuals’ perception of the quality of living spaces is also related to the perception of their own health. However, some other factors such as age or the amount of facilities are also thought to have an impact on health. Furthermore,  the data showed no significant relation between the amount of greenery and health, as is commonly believed. Therefore, it is important to conduct further research into this correlation. 
+
+The above-mentioned conclusions can be facilitated by many factors and might seem difficult to understand for the general public. They can create misunderstandings and lead to false implications. This in turn can cause irrelevant policy development. To clarify those results and gain a better understanding of the situation further analysis is needed. 
+
+The aim of this report is to deliver that clarification. First, a regression analysis is done to examine the relationship between health and public space, wealth and age. Secondly, a data classification is performed. A classification can help to manipulate, track and analyze individual pieces of data for forecasting and in turn draw a clearer image of what policies should be in order to support not only current trends but also continue being relevant in the future.  
+
+# Regression Analysis
+The results of the exploratory analysis indicated some direction for new policy development. There is a common understanding that greenery in the living environment can improve health. However, the results of the previous report showed that there might be other factors with higher significance for good health among inhabitants of Amsterdam.  While it was concluded that health can to an extent be facilitated by the quality of the perceived living environment, it also became clear that there might be some other facilitators having a bigger impact on individuals’ self-estimated good health. This part of the report will bring the focus to understanding which parameters are most important determinants of health and what is the correlation between them. It will help to describe the strength and character of correlations between health (the dependent variable) and the independent variables, and thus adjust the insights accordingly and answer the following research question: What are the true facilitators of self-assessed good health in Amsterdam? 
+
+## Results
+The previous report indicated some variables that could be significant for the correct understanding of the health situation amid districts in Amsterdam. The forward selection procedure performed for this report made it clear that some variables showed more significance. Those variables are described as independent variables and are as follows: disposable income, perceived aesthetics of the living environment, and total amount of facilities. On the other hand, some variables that were proven to be less important were the amount of greenery in the inhabited districts and age.   The following section of this report will aim at describing the accuracy of the significant variables and strength and character of correlations with health in Amsterdam’s districts.   
+
+```{r Multiple Linear Regression Model, echo = FALSE, warning = FALSE, comment = NA}
+
+  m_setup_wealth_social_2 = lm(hea_good ~ (pub_setup) + (poly(inc_disposable, 2)) + (poly(hou_value, 2))  + poly(tot_facilities, 2), data = all_data)
+  summary(m_setup_wealth_social_2)
+
+```
+
+Only perceived aesthetics of the living environment, housing value, disposable income and number of social facilities, were found to have high significance. Percentage of greenery and age of the residents were found to have low significance.  
+
+To further understand those relationships and their significance a multiple linear regression model was built. It can be said that the model is reliable because of its high R2 value and symmetrical distribution of the scatterplot and the histogram. The residuals seem to be symmetric. It appeared that the interaction effect between health, wealth, and quality of the living environment is statistically significant. This model concludes that disposable income, housing value, and social facilities have the strongest impact on residents’ health. People with higher incomes can afford better healthcare and personal care. This can positively add to their self-estimated health. Furthermore, more access to social facilities creates more opportunities for physical and social activities which are known to be good for one’s health. Surprisingly, the model shows a lower significance of the quality of the living environment on the residents’ self-assessed good health in comparison to the other factors.
+
+## ANOVA Analysis
+
+```{r ANOVA Table, echo = FALSE, warning = FALSE, comment = NA}
+
+# Health & Easthetics Environment & Wealth & Social Facilities
+  aim_setup_wealth_social = lm(hea_good ~ (pub_setup) * 
+                                 (poly(inc_disposable, 2)) * 
+                                 (poly(hou_value, 2)) * (tot_facilities) - 
+                                 pub_setup:poly(inc_disposable, 2):tot_facilities -
+                                 pub_setup:poly(hou_value, 2):tot_facilities -
+                                 poly(hou_value, 2):tot_facilities - 
+                                 poly(inc_disposable, 2):poly(hou_value, 2):tot_facilities -
+                                 pub_setup:poly(inc_disposable, 2):poly(hou_value, 2) -
+                                 pub_setup:poly(hou_value, 2) - 
+                                 pub_setup:poly(inc_disposable, 2):poly(hou_value, 2):tot_facilities -
+                                 pub_setup:tot_facilities - 
+                                 poly(inc_disposable, 2):poly(hou_value, 2), 
+                                 data = all_data)
+  Anova(aim_setup_wealth_social, type = 2)
+
+```
+
+The ANOVA table was created to test hypotheses about group means while controlling for other factors and assess the importance of the factors next to the regression model. The analysis of the table shows once again that income, housing value, and social facilities appeared to be the important predictors. Quality of the living environment was proven to be less significant. Below you can see that the model that was created as a result is of high quality due to the normal distribution of the histogram and the symmetrical distribution of the scatter plot. 
+
+```{r MLP after ANOVA, echo = FALSE, warning = FALSE, fig.show = 'hold', out.width= '50%', comment = NA}
+  
+    ggplot(augment(aim_setup_wealth_social, newdata = all_data), aes(.resid)) + 
+    geom_histogram()
+  ggplot(augment(aim_setup_wealth_social, newdata = all_data), aes(.fitted, .resid)) +
+    geom_point() +
+    geom_hline(yintercept = 0, linetype = 'dashed')
+
+```
+
+## Conclusion 
+The initial hypothesis and conclusions of the previous report are clarified. Amid various districts of Amsterdam wealth and access to social facilities correlate with higher percentages of inhabitants who perceive their health as good. Quality of the living environment is less significant. In comparison to the results of the previous report it is now clear that good health amid citizens of Amsterdam is not as much facilitated by the quality of the public space that they live in, but more so by their financial situation.  
+
+# Classification Models
+In order to make effective investments, ACME bases their investments on geographical data. However, this geographical data is only provided until the next calendar year. As a result, ACME only has data, without corresponding geographic aeras. However, by using historical data a prediction can be made to link the most recent data to a geographical area. By using the datasets used in earlier parts of this report, several classifiers will be built to assess whether it is possible to do this effectively. The question is, which classifier should be used to predict geographical areas of the most recent data?
+
+To assess and compare the different classifiers, a look is taken into two performance metrics. First, overall accuracy was taken into account as it is important to have an accurate classifier when matching geographical areas with the most recent data. Second, a look is taken into the f-score range, which takes into account the imbalance of the classifier as it is possible that the classifier is very good in predicting a certain district, but bad at predicting another district. For all classifiers, a confusion matrix is shown to give an overview of the classifier.
+
+For every classifier, it was decided to use the following inputs, based on the models built earlier. First, a look was taken into the interaction effects of all health components. Since this is only possible for a multinomial regression classifier, these interaction effects were dropped for the other two classifiers. Then, disposable income, housing value and total social facilities were added. In addition, the aesthetics of the public setup and the average amount of greenery were added. At last, the percentage of population with an age above 60 was added to complete the model.
+
+## Multinomial Regresson
+The first classifier that was built is a so-called multinomial regression classifier. This type of classifier can be used to predict categorial variables based on the input of multiple dependent variables. This is done by making complex calculations.  
+
+With this model, an overall accuracy of 75.8% was achieved. What is interesting is that the range of the f-scores of the model is quite big as it ranges from 66.1% to 89.5%. The model does not predict well for the Centrum district and Zuid district, but does a very good job at predicting Nieuw-West and Zuidoost.
+
+```{r Multinomial Logistic Classifier, echo = FALSE, warning = FALSE, fig.show = 'hold', out.width = '50%', comment = NA}
+
+### Multinomial Regression Classifier
+
+  # Make Model
+mrc = multinom(district ~ (hea_good + hea_psych + hea_overweight + hea_lonely)^2 + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder, all_data, trace = FALSE)
+  # Create Classifier
+p_mrc = predict(mrc)
+  # Assess Classifier
+confusion_matrix(all_data$district, p_mrc)
+
+```
+
+## Decision Tree
+Secondly, a random forest model was built. This model is built upon the principle of a decision tree. As the term explains, a ‘forest’ is made by making different decision trees randomly. Then, a prediction is made based on the ‘votes’ of the decision trees, with the majority being the answer. For this classifier, the same parameters were used. However, decision tree classifiers do not work with interaction effects, so these are dropped. 
+
+Since this classifier is based on randomness, an approximate accuracy of 90% was achieved. This classifier performs significantly better than the multinomial regression classifier. In addition, the f-score range is smaller as well. With this classifier, an f-score range of 85.1% to 95.0% was achieved. The classifier predicted the worst for the West district, while it did the best with the Zuidoost district.
+
+```{r Random Forest Classifier, echo = FALSE, warning = FALSE, fig.show = 'hold', out.width = '50%', comment = NA}
+
+  ## Random Forrest
+  # Make Model
+m_rf = randomForest(district ~ hea_good + hea_psych + hea_overweight + hea_lonely + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder, all_data, mtry = 4, ntree = 500)
+
+  # Make Classifier
+p_rf = predict(m_rf, type = 'class')
+  # Asses Classifier
+confusion_matrix(all_data$district, p_rf)
+
+```
+
+## Support Vector Machine
+At last, a support vector machine was built. This model is built around separating data points by drawing so-called hyperplanes between different categories. When the data is not easy enough to split in a straight line, several complex calculations in a multidimensional space are performed and reversed to make a non-linear border between the data points. 
+
+With this model, an accuracy of 82.8% was achieved. An f-score range of 74.4% to 91.9%. The classifier predicts the worst for West, and the best for Zuidoost. This classifier thus outperforms the multinomial regression model, but is underperforming compared to the random forest classifier. 
+
+```{r Support Vector Machine Classifier (Radial Kernel), echo = FALSE, warning = FALSE, fig.show = 'hold', out.width = '50%', comment = NA}
+
+  ## Radial Kernel
+  # Make Model
+m_svm_r = svm(district ~ hea_good + hea_psych + hea_overweight + hea_lonely + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder, all_data)
+
+  # Make Classifier
+p_svm_r = predict(m_svm_r)
+  # Assess Classifier
+confusion_matrix(all_data$district, p_svm_r)
+
+```
+
+## Cross Validation
+To optimize the performance of the classifiers mentioned above, several cross validations are performed. Cross validations help to optimize the classifiers by tuning so-called hyperparameters of the classifier. Optimizing can be done in terms of accuracy, but also for compute time. 
+
+It was decided to drop the multinomial regression classifier as this classifier did not match the performance of the other two classifiers. 
+
+Two cross validations were done for the random forest classifier. First, cross validation was done to assess what the optimal number of trees. This helps to improve computational efficiency of the classifier. As can be seen on the left graph below, the performance of the classifier drops after 150 trees. As a result, it is more efficient to use 150 trees than the 500 trees used in the initial random forest classifier. Calculating the extra 350 trees is a waste of time. 
+
+```{r Random Forrest Classifier Cross Validation, echo=FALSE, warning=FALSE, fig.show = 'hold', out.width = '50%', comment = NA}
+
+  ## Random Forest
+
+  # Number of Trees
+  # Use Validator Function
+fit_with_ntree <- function(training, validation, h, ...) {
+  # fit the forest with h trees
+  m <- randomForest(district ~ hea_good + hea_psych + hea_overweight + hea_lonely + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder,
+                    data = training, ntree = h)
+  # predict on validation set
+  p <- predict(m, newdata = validation)
+  
+  # Compute evaluation metrics
+  # Note how for precision, recall and F we compute the mean score across classes
+  list(a = accuracy(validation$district, p),
+       p = mean(precision(validation$district, p)),
+       r = mean(recall(validation$district, p)),
+       f = mean(f(validation$district, p)))
+}
+  # Create Validator
+set.seed(321)
+
+p_rf_cv <- kfold_cv(all_data, district, 10, seq(10, 300, 20), fit_with_ntree)
+  # Plot Validator
+pivot_longer(p_rf_cv, cols = -(.h:.fold), names_to = "metric") %>%
+  ggplot(aes(.h, value, color = metric, fill = metric)) + 
+  stat_summary(fun = "mean", geom = "point") +
+  geom_smooth(se = TRUE, alpha = .15) +
+  labs(x = "number of trees", y = "value")
+
+  # MTRY
+  # Use Validator Function
+fit_with_mtry = function(training, validation, h, ...) {
+  m = randomForest(district ~ hea_good + hea_psych + hea_overweight + hea_lonely + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder,
+                   data = training, mtry = h, ntree = 150)
+  # prediction on validation set
+  p = predict(m, validation)
+  
+  # Compute Evaluation Metrics
+  list(a = accuracy(validation$district, p),
+       p = mean(precision(validation$district, p)),
+       r = mean(recall(validation$district, p)),
+       f = mean(f(validation$district, p)))
+}
+  # Create Validator
+set.seed(0)
+
+p_rf_cv_mtry = kfold_cv(all_data, district, 10, c(1, 2, 3, 4, 5, 6, 7, 8, 9), fit_with_mtry)
+  # Plot Validator
+pivot_longer(p_rf_cv_mtry, cols = -(.h:.fold), names_to = "metric") %>%
+  ggplot(aes(.h, value, color = metric, fill = metric)) + 
+  stat_summary(fun = "mean", geom = "point") +
+  geom_smooth(se = TRUE, alpha = .15) +
+  labs(x = "mtry", y = "value") 
+
+```
+
+Second, a cross validation was performed to find what the optimal number of features for new branches was for the random forest. As can be seen on the right graph above, making branches based on 3 features seems to result in the best Random Forest classifier with an accuracy of approximately 90%. As a result, a random forest with 150 trees and 3 features for new branches is optimal. 
+
+For the support vector machine two cross validation were performed as well. First, one in which the classifier is punished when it falsely predicts a district. As can be seen in the left graph below, the performance of the model keeps rising as this ‘cost’ is increased. However, a cost that is too high will result in a less generalizable model. Therefore, it was chosen to keep the cost at 10, as increasing it any higher also results in diminishing results. 
+
+```{r Support Vector Machine Classifier Cross Validation, echo = FALSE, warning = FALSE, fig.show = 'hold', out.width = '50%', comment = NA}
+
+  ## Support Vector Machine
+  # Use Validator Function
+fit_with_cost <- function(training, validation, h, ...) {
+  m <- svm(district ~ hea_good + hea_psych + hea_overweight + hea_lonely + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder,
+           data = training, cost = h)
+  # predict on validation set
+  p <- predict(m, validation)
+  
+  # Compute evaluation metrics
+  list(a = accuracy(validation$district, p),
+       p = mean(precision(validation$district, p)),
+       r = mean(recall(validation$district, p)),
+       f = mean(f(validation$district, p)))
+}
+  # Create Validator
+set.seed(0)
+
+p_svm_cv <- kfold_cv(all_data, district, 10, c(.1, .25, .5, .75, 1, 2.5, 5, 7.5, 10, 15, 25, 50, 100), fit_with_cost)
+  # Plot Validator
+pivot_longer(p_svm_cv, cols = -(.h:.fold), names_to = "metric") %>%
+  ggplot(aes(.h, value, color = metric, fill = metric)) + 
+  stat_summary(fun = "mean", geom = "point") +
+  geom_smooth(se = TRUE, alpha = .15) +
+  labs(x = "cost", y = "value") +
+  scale_x_log10()
+
+  # Gamma
+  # Use Validator Function
+fit_with_gamma <- function(training, validation, h, ...) {
+  m <- svm(district ~ hea_good + hea_psych + hea_overweight + hea_lonely + inc_disposable + hou_value + tot_facilities + pub_setup + avg_greenery + pop_elder,
+           data = training, cost = 10, gamma = h)
+  # predict on validation set
+  p <- predict(m, validation)
+  
+  # Compute evaluation metrics
+  list(a = accuracy(validation$district, p),
+       p = mean(precision(validation$district, p)),
+       r = mean(recall(validation$district, p)),
+       f = mean(f(validation$district, p)))
+}
+# Create Validator
+set.seed(12345)
+
+p_svm_cv_g <- kfold_cv(all_data, district, 10, seq(.01, 2, .1), fit_with_gamma)
+
+  # Plot Validator
+pivot_longer(p_svm_cv_g, cols = -(.h:.fold), names_to = "metric") %>%
+  ggplot(aes(.h, value, color = metric, fill = metric)) + 
+  stat_summary(fun = "mean", geom = "point") +
+  geom_smooth(se = TRUE, alpha = .15) +
+  labs(x = "gamma", y = "value") +
+  scale_x_log10()
+
+```
+
+Second, cross validation was performed on another hyperparameter, gamma, which affects the curvature of the hyperplane. As can be seen on the right graph above, a gamma of 0.95 seems to result in an optimal model, with an accuracy of 95%. As a result, the optimal hyperparameters are a cost of 10, and a gamma value of 0.95.
+
+## Recommendation
+Three different classifiers were developed in order to match data points to a certain geographical location. It was found that the multinomial regression classifier was unable to match the performance of the other two classifiers. After performing several cross validations to optimise the model, it was found that the support vector machine classifier was the best performing classifier, with an accuracy of 95%. Therefore, it is recommended to use this classifier to predict the geographical area of the most recent data. 
+
+## Discussion
+It must be noted that all classifiers are trained on an imbalanced dataset. As a result, the classifiers are biased towards the districts that have the most data points. Also, due to randomness, the performance of the Random Forest classifier is subjected to change with every run. As a result, the performance will slightly change compared to the performance in this report. 
